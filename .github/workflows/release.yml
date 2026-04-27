@@ -1,0 +1,35 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+# Required repo secret:
+#   NPM_TOKEN — npmjs.org Automation token with publish access to @luniq/sdk
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm install
+      - run: npm run build
+      - name: Verify package.json version matches tag
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG" ]; then
+            echo "::error::package.json version ($PKG_VERSION) does not match tag ($TAG)"
+            exit 1
+          fi
+      - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
