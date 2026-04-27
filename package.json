@@ -1,0 +1,17 @@
+{
+  "name": "@luniq/sdk",
+  "version": "1.0.0",
+  "description": "Luniq.AI web SDK — analytics + in-app guides + Design Mode",
+  "main": "dist/luniq.js",
+  "module": "dist/luniq.esm.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc && rollup -c"
+  },
+  "devDependencies": {
+    "typescript": "5.5.4",
+    "rollup": "4.20.0",
+    "@rollup/plugin-typescript": "12.1.0",
+    "tslib": "2.6.3"
+  }
+}
