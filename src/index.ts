@@ -2,6 +2,74 @@ import { _designMode } from "./design-mode";
 
 type Props = Record<string, any>;
 
+// ── Auto-capture helpers ─────────────────────────────────────────────────────
+// User-agent parsing: minimal regex-based classifier. Real ua-parser-js is
+// 30 KB; this catches the 95% case in <1 KB. Returns { browser, version,
+// deviceType } for breakdowns. Server-side ingest treats them as columns.
+function parseUserAgent(ua: string): { browser: string; version: string; deviceType: string } {
+  const lower = ua.toLowerCase();
+  const isTablet = /ipad|tablet|playbook|silk|kindle/.test(lower) || (/android/.test(lower) && !/mobile/.test(lower));
+  const isMobile = /mobi|iphone|ipod|blackberry|opera mini|opera mobi|webos/.test(lower) && !isTablet;
+  const deviceType = isTablet ? "tablet" : isMobile ? "mobile" : "desktop";
+  const tests: [string, RegExp][] = [
+    ["Edge",    /edg\/(\d+(?:\.\d+)?)/],
+    ["Opera",   /opr\/(\d+(?:\.\d+)?)/],
+    ["Chrome",  /chrome\/(\d+(?:\.\d+)?)/],
+    ["Firefox", /firefox\/(\d+(?:\.\d+)?)/],
+    ["Safari",  /version\/(\d+(?:\.\d+)?).*safari/],
+    ["Safari",  /safari\/(\d+(?:\.\d+)?)/],
+  ];
+  for (const [name, re] of tests) {
+    const m = lower.match(re);
+    if (m) return { browser: name, version: m[1], deviceType };
+  }
+  return { browser: "Other", version: "", deviceType };
+}
+
+// Acquisition: UTM params from the landing URL, plus referrer host. Sticky
+// per browser session via sessionStorage so post-landing events keep the
+// original campaign — matches GA4's behavior. URL params win over a previous
+// session value (last-touch). Cleared automatically when the tab closes.
+const ACQUISITION_KEY = "luniq_acq";
+function readAcquisition(): {
+  utm_source: string; utm_medium: string; utm_campaign: string;
+  utm_term: string; utm_content: string; referrer_domain: string;
+} {
+  const empty = { utm_source: "", utm_medium: "", utm_campaign: "", utm_term: "", utm_content: "", referrer_domain: "" };
+  try {
+    const url = new URL(location.href);
+    const fromUrl = {
+      utm_source:   url.searchParams.get("utm_source")   || "",
+      utm_medium:   url.searchParams.get("utm_medium")   || "",
+      utm_campaign: url.searchParams.get("utm_campaign") || "",
+      utm_term:     url.searchParams.get("utm_term")     || "",
+      utm_content:  url.searchParams.get("utm_content")  || "",
+      referrer_domain: refDomain(document.referrer),
+    };
+    const hasUrlSignal = !!(fromUrl.utm_source || fromUrl.utm_medium || fromUrl.utm_campaign);
+    if (hasUrlSignal) {
+      sessionStorage.setItem(ACQUISITION_KEY, JSON.stringify(fromUrl));
+      return fromUrl;
+    }
+    const cached = sessionStorage.getItem(ACQUISITION_KEY);
+    if (cached) {
+      try { return { ...empty, ...JSON.parse(cached) }; } catch {}
+    }
+    // No UTM signal at all — fall back to just the referrer domain.
+    return { ...empty, referrer_domain: fromUrl.referrer_domain };
+  } catch {
+    return empty;
+  }
+}
+function refDomain(ref: string): string {
+  if (!ref) return "";
+  try {
+    const u = new URL(ref);
+    if (u.hostname === location.hostname) return ""; // internal nav, not a real referrer
+    return u.hostname;
+  } catch { return ""; }
+}
+
 interface Config {
   apiKey: string;
   endpoint: string;
@@ -109,6 +177,8 @@ class LuniqClient {
   }
 
   private enrich(p: Props): Props {
+    const ua = parseUserAgent(navigator.userAgent);
+    const acq = readAcquisition();
     return {
       ...p,
       os_type: "WEB",
@@ -117,6 +187,18 @@ class LuniqClient {
       url: location.href,
       path: location.pathname,
       referrer: document.referrer,
+      // Browser + device classification (auto-detected, can be overridden by caller)
+      browser: ua.browser,
+      browser_version: ua.version,
+      device_type: ua.deviceType,
+      // Marketing attribution (UTM params + referrer domain). Sticky for the
+      // session so post-landing events keep the original campaign context.
+      utm_source:   acq.utm_source,
+      utm_medium:   acq.utm_medium,
+      utm_campaign: acq.utm_campaign,
+      utm_term:     acq.utm_term,
+      utm_content:  acq.utm_content,
+      referrer_domain: acq.referrer_domain,
       ...this.traits,
     };
   }
