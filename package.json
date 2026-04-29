@@ -1,6 +1,6 @@
 {
   "name": "@luniq/sdk",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Luniq.AI web SDK \u2014 analytics + in-app guides + Design Mode",
   "main": "dist/luniq.js",
   "module": "dist/luniq.esm.js",

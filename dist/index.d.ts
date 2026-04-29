@@ -18,6 +18,12 @@ declare class LuniqClient {
     private sessionTimeoutMs;
     private flushTimer;
     start(cfg: Config): void;
+    /** Manually surface a banner / guide / survey by id. Useful for
+     *  context-specific moments your code already knows about (e.g. fire
+     *  the upgrade survey after a successful checkout). */
+    showBanner(id: string): void;
+    showGuide(id: string): void;
+    showSurvey(id: string): void;
     /** Manually enter design mode with a 6-char pairing code from the dashboard. */
     enableDesignMode(code: string): void;
     identify(visitorId: string, accountId?: string, traits?: Props): void;

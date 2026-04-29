@@ -1,4 +1,5 @@
 import { _designMode } from "./design-mode";
+import { _engage } from "./engage";
 
 type Props = Record<string, any>;
 
@@ -122,7 +123,20 @@ class LuniqClient {
     // Design Mode: auto-pair if URL has ?luniq_design=CODE
     _designMode.configure(this.cfg.endpoint, this.cfg.apiKey);
     _designMode.maybeAutoPair();
+
+    // In-app engagement: fetch + render guides/banners/surveys defined
+    // in the dashboard. Targeting happens inside the runtime; impressions
+    // and dismissals stream back through the existing track() pipeline,
+    // so the dashboard counts every render automatically.
+    _engage.start(this, this.cfg.endpoint, this.cfg.apiKey, this.cfg.environment || "PRD");
   }
+
+  /** Manually surface a banner / guide / survey by id. Useful for
+   *  context-specific moments your code already knows about (e.g. fire
+   *  the upgrade survey after a successful checkout). */
+  showBanner(id: string) { _engage.showBanner(id); }
+  showGuide(id: string)  { _engage.showGuide(id); }
+  showSurvey(id: string) { _engage.showSurvey(id); }
 
   /** Manually enter design mode with a 6-char pairing code from the dashboard. */
   enableDesignMode(code: string) {
@@ -245,10 +259,15 @@ class LuniqClient {
       this.track("$tap", props);
     }, true);
 
-    // SPA route change
+    // SPA route change — both auto-tracks the screen view and notifies
+    // the engagement runtime so it re-evaluates audience targeting for
+    // the new path.
     const origPush = history.pushState;
     const origReplace = history.replaceState;
-    const onRoute = () => this.screen(document.title || location.pathname);
+    const onRoute = () => {
+      this.screen(document.title || location.pathname);
+      window.dispatchEvent(new Event("luniq:route-change"));
+    };
     history.pushState = function (...args) { const r = origPush.apply(this, args as any); onRoute(); return r; };
     history.replaceState = function (...args) { const r = origReplace.apply(this, args as any); onRoute(); return r; };
     window.addEventListener("popstate", onRoute);
