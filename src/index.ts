@@ -1,5 +1,6 @@
 import { _designMode } from "./design-mode";
 import { _engage } from "./engage";
+import { TestRunner } from "./test-runner";
 
 type Props = Record<string, any>;
 
@@ -106,6 +107,23 @@ class LuniqClient {
   private sessionTimeoutMs = 30 * 60 * 1000;
   private flushTimer: any;
 
+  // ── resilience state ────────────────────────────────────────────
+  // Circuit breaker: after consecutive failures we back off exponentially
+  // (1s, 2s, 4s, … capped at 5 min) so a backend outage doesn't have every
+  // customer hammering us in lockstep when we recover.
+  private consecFailures = 0;
+  private retryAfter = 0; // epoch ms; flush() returns early before this time
+  // Remote kill switch: SDK polls /v1/sdk/config and respects { enabled, sample }.
+  // Cached for 5 min in localStorage so a config-endpoint outage can't silence
+  // working SDKs.
+  private remoteEnabled = true;
+  private remoteSample = 1.0;
+  // Error reporting: count failures and beacon at most once per hour so we
+  // see customer-side breakage without flooding our own ingest.
+  private errorWindowStart = 0;
+  private errorWindowCount = 0;
+  private lastErrorBeacon = 0;
+
   start(cfg: Config) {
     this.cfg = { autoCapture: true, batchSize: 50, flushIntervalMs: 30000, environment: "PRD", ...cfg };
     this.visitorId = localStorage.getItem("hp_visitor");
@@ -117,8 +135,20 @@ class LuniqClient {
     window.addEventListener("visibilitychange", () => this.flush());
     window.addEventListener("beforeunload", () => this.flush(true));
 
+    this.loadRemoteConfig();
+    this.refreshRemoteConfig();
+
     if (this.cfg.autoCapture) this.installAutoCapture();
     this.screen(document.title || location.pathname);
+    this.installAnchorScanner();
+
+    // Test mode: only activates if the API key is in the test prefix.
+    // Production keys (lq_live_*) never enter the runner.
+    if (TestRunner.isTestKey(this.cfg.apiKey)) {
+      try {
+        new TestRunner(this.cfg.endpoint, this.cfg.apiKey).start();
+      } catch { /* never break customer pages on runner failure */ }
+    }
 
     // Design Mode: auto-pair if URL has ?luniq_design=CODE
     _designMode.configure(this.cfg.endpoint, this.cfg.apiKey);
@@ -154,24 +184,35 @@ class LuniqClient {
   }
 
   track(name: string, properties: Props = {}) {
-    if (Date.now() - this.lastActivity > this.sessionTimeoutMs) this.sessionId = uuid();
-    this.lastActivity = Date.now();
-    const ev: PulseEvent = {
-      id: uuid(),
-      name,
-      properties: this.enrich(properties),
-      timestamp: new Date().toISOString(),
-      sessionId: this.sessionId,
-      visitorId: this.visitorId,
-      accountId: this.accountId,
-    };
-    this.queue.push(ev);
-    this.persist();
-    if (this.queue.length >= (this.cfg.batchSize || 50)) this.flush();
+    try {
+      // Honor the remote kill switch + sampling. A flipped `enabled=false`
+      // makes track() a no-op in production within ~5 min — no app update
+      // needed. Sampling drops a fraction of events at the source so a
+      // misbehaving customer can be dialed down without code changes.
+      if (!this.remoteEnabled) return;
+      if (this.remoteSample < 1 && Math.random() >= this.remoteSample) return;
+
+      if (Date.now() - this.lastActivity > this.sessionTimeoutMs) this.sessionId = uuid();
+      this.lastActivity = Date.now();
+      const ev: PulseEvent = {
+        id: uuid(),
+        name,
+        properties: this.enrich(properties),
+        timestamp: new Date().toISOString(),
+        sessionId: this.sessionId,
+        visitorId: this.visitorId,
+        accountId: this.accountId,
+      };
+      this.queue.push(ev);
+      this.persist();
+      if (this.queue.length >= (this.cfg.batchSize || 50)) this.flush();
+    } catch { /* never throw into customer code */ }
   }
 
   screen(name: string, properties: Props = {}) {
     this.track("$screen", { ...properties, screen_name: name });
+    // SPA route change → re-detect anchors on the new view.
+    this.seenAnchors.clear();
   }
 
   optOut(on: boolean) { localStorage.setItem("hp_opt_out", on ? "1" : "0"); }
@@ -224,21 +265,171 @@ class LuniqClient {
   async flush(sync = false) {
     if (localStorage.getItem("hp_opt_out") === "1") return;
     if (this.queue.length === 0) return;
+    // Circuit breaker — if we're inside a backoff window, skip. The unload
+    // path (sync=true) is exempt: best-effort sendBeacon never blocks unload
+    // and we'd rather try to deliver than drop on close.
+    if (!sync && Date.now() < this.retryAfter) return;
+
     const batch = this.queue.splice(0, this.cfg.batchSize || 50);
     this.persist();
     const body = JSON.stringify({ events: batch });
     const url = `${this.cfg.endpoint}/v1/events`;
     const headers = { "Content-Type": "application/json", "X-Luniq-Key": this.cfg.apiKey };
+
+    let ok = false;
+    let errCode = "fetch_error";
     try {
       if (sync && "sendBeacon" in navigator) {
-        navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
+        ok = navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
       } else {
-        const r = await fetch(url, { method: "POST", headers, body, keepalive: true });
-        if (!r.ok) throw new Error("send failed");
+        // 5-second timeout on the network call. Without this, a hung TCP
+        // connection (rare but real — origin behind a misbehaving LB) ties
+        // up a fetch slot on every customer page load.
+        const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+        const timer = ctrl ? setTimeout(() => ctrl.abort(), 5000) : 0;
+        try {
+          const r = await fetch(url, { method: "POST", headers, body, keepalive: true, signal: ctrl?.signal });
+          if (!r.ok) {
+            errCode = `http_${r.status}`;
+            throw new Error("send failed");
+          }
+          ok = true;
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      }
+    } catch (e: any) {
+      if (e && e.name === "AbortError") errCode = "timeout";
+    }
+
+    if (ok) {
+      this.consecFailures = 0;
+      this.retryAfter = 0;
+      return;
+    }
+
+    // Failure path — re-queue at the front so events keep their order, then
+    // open the circuit for an exponentially growing window.
+    this.queue.unshift(...batch);
+    this.persist();
+    this.consecFailures += 1;
+    const backoffMs = Math.min(300_000, 1000 * Math.pow(2, Math.min(this.consecFailures - 1, 8)));
+    this.retryAfter = Date.now() + backoffMs;
+    this.recordSdkError(errCode, "ingest failure");
+  }
+
+  private recordSdkError(code: string, message: string) {
+    // Count failures, but only beacon home at most once per hour. Crucially,
+    // this beacon must not itself fail loudly — wrap the whole thing in a
+    // try/catch and never throw into customer code.
+    try {
+      const now = Date.now();
+      if (now - this.errorWindowStart > 3600_000) {
+        this.errorWindowStart = now;
+        this.errorWindowCount = 0;
+      }
+      this.errorWindowCount += 1;
+
+      if (now - this.lastErrorBeacon < 3600_000) return;
+      this.lastErrorBeacon = now;
+      const url = `${this.cfg.endpoint}/v1/sdk/error`;
+      const body = JSON.stringify({
+        sdk: "web",
+        version: "1.3.0",
+        code,
+        message,
+        count: this.errorWindowCount,
+      });
+      // Use sendBeacon if available — it survives navigation and is fire-
+      // and-forget. Falls back to fetch with a short timeout.
+      if (typeof navigator !== "undefined" && "sendBeacon" in navigator) {
+        try {
+          navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
+          return;
+        } catch { /* fall through to fetch */ }
+      }
+      const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const timer = ctrl ? setTimeout(() => ctrl.abort(), 3000) : 0;
+      fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Luniq-Key": this.cfg.apiKey },
+        body,
+        keepalive: true,
+        signal: ctrl?.signal,
+      }).catch(() => { /* swallow — error reporter must never error loudly */ })
+        .finally(() => { if (timer) clearTimeout(timer); });
+    } catch { /* swallow */ }
+  }
+
+  private loadRemoteConfig() {
+    try {
+      const raw = localStorage.getItem("hp_sdk_cfg");
+      if (!raw) return;
+      const cfg = JSON.parse(raw);
+      if (typeof cfg.enabled === "boolean") this.remoteEnabled = cfg.enabled;
+      if (typeof cfg.sample === "number") this.remoteSample = Math.max(0, Math.min(1, cfg.sample));
+    } catch { /* ignore — defaults stay */ }
+  }
+
+  private async refreshRemoteConfig() {
+    try {
+      const url = `${this.cfg.endpoint}/v1/sdk/config?key=${encodeURIComponent(this.cfg.apiKey)}`;
+      const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const timer = ctrl ? setTimeout(() => ctrl.abort(), 4000) : 0;
+      try {
+        const r = await fetch(url, { method: "GET", signal: ctrl?.signal });
+        if (!r.ok) return;
+        const cfg = await r.json();
+        if (typeof cfg.enabled === "boolean") this.remoteEnabled = cfg.enabled;
+        if (typeof cfg.sample === "number") this.remoteSample = Math.max(0, Math.min(1, cfg.sample));
+        try {
+          localStorage.setItem("hp_sdk_cfg", JSON.stringify({
+            enabled: this.remoteEnabled, sample: this.remoteSample,
+          }));
+        } catch { /* private mode */ }
+        const pollSecs = Math.max(60, Math.min(3600, Number(cfg.pollSecs) || 300));
+        setTimeout(() => this.refreshRemoteConfig(), pollSecs * 1000);
+      } finally {
+        if (timer) clearTimeout(timer);
       }
     } catch {
-      this.queue.unshift(...batch);
-      this.persist();
+      // Network error — stick with current values, retry in 10 min.
+      setTimeout(() => this.refreshRemoteConfig(), 600_000);
+    }
+  }
+
+  // Track which anchors we've already reported this page-view so we only
+  // fire one $luniq_anchor_seen per (anchor id) per page. Reset on screen()
+  // calls (single-page-app navigations) so SPA route changes get a fresh
+  // scan when the new view's elements appear.
+  private seenAnchors: Set<string> = new Set();
+
+  private installAnchorScanner() {
+    // Scan now + on every DOM mutation (debounced) so dynamically-rendered
+    // elements are picked up. Anchor convention: any element with a
+    // data-luniq-anchor attribute (preferred) or class luniq-anchor.
+    const scan = () => {
+      try {
+        const els = document.querySelectorAll<HTMLElement>("[data-luniq-anchor]");
+        els.forEach(el => {
+          const id = el.getAttribute("data-luniq-anchor") || "";
+          if (!id || this.seenAnchors.has(id)) return;
+          this.seenAnchors.add(id);
+          this.track("$luniq_anchor_seen", {
+            anchor: id,
+            screen: location.pathname,
+          });
+        });
+      } catch { /* ignore selector errors */ }
+    };
+    scan();
+    if (typeof MutationObserver !== "undefined") {
+      let pending = 0;
+      const obs = new MutationObserver(() => {
+        if (pending) return;
+        pending = window.setTimeout(() => { pending = 0; scan(); }, 500);
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
     }
   }
 
