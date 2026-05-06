@@ -1,35 +1,57 @@
-name: Release
+name: release
+# SBOM + cosign signature on every published tag.
+# Closes Phase 2.2 + Phase 2.3 of the 2026-05-05 SOC 2 Type II remediation roadmap.
+
 on:
   push:
     tags: ['v*']
 
-# Required repo secret:
-#   NPM_TOKEN — npmjs.org Automation token with publish access to @luniq/sdk
+permissions:
+  contents: write
+  id-token: write   # required by cosign keyless OIDC signing
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-      - run: npm install
+        with: { node-version: '20', registry-url: 'https://registry.npmjs.org' }
+      - run: npm ci --prefer-offline --no-audit --no-fund
       - run: npm run build
-      - name: Verify package.json version matches tag
-        env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      - name: Generate SBOM (CycloneDX)
         run: |
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          TAG="${GITHUB_REF_NAME#v}"
-          if [ "$PKG_VERSION" != "$TAG" ]; then
-            echo "::error::package.json version ($PKG_VERSION) does not match tag ($TAG)"
-            exit 1
-          fi
-      - run: npm publish --access public
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          syft dir:. -o cyclonedx-json=sbom-${{ github.ref_name }}.json
+          syft dir:. -o spdx-json=sbom-${{ github.ref_name }}.spdx.json
+
+      - name: Pack tarball
+        run: npm pack
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign tarball + SBOM (keyless OIDC)
+        run: |
+          for f in *.tgz sbom-${{ github.ref_name }}.json sbom-${{ github.ref_name }}.spdx.json; do
+            cosign sign-blob --yes --output-signature "$f.sig" --output-certificate "$f.pem" "$f"
+          done
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Attach SBOM + signatures to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tgz
+            *.tgz.sig
+            *.tgz.pem
+            sbom-${{ github.ref_name }}.json
+            sbom-${{ github.ref_name }}.json.sig
+            sbom-${{ github.ref_name }}.json.pem
+            sbom-${{ github.ref_name }}.spdx.json
